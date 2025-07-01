@@ -1,0 +1,171 @@
+```{r}
+library(tidyverse)
+library(ggtree)
+library(ape)
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+  "green4",
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "black", "gold1",
+  "skyblue2", "#FB9A99", # lt pink
+  "palegreen2",
+  "#CAB2D6", # lt purple
+  "#FDBF6F", # lt orange
+  "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+
+heatmap.colors <- c("gray","#255262", "#3F6A79", "#487C8F", "#6692A2", "#86A8B6", "#FFED66","#EE8434", "white", "#EE8434", "#EDEBA0")
+names(heatmap.colors) <- c(names(gene_pres), "Fluo", "HPLC", "0", "> 0.2", "< -0.2")
+
+add_rootbranch <- function(tree, branch_length = 1) {
+  
+  n_tips <- length(tree$tip.label)
+  tree$edge[tree$edge > n_tips] <- tree$edge[tree$edge > n_tips] + 1
+  tree$edge <- rbind(c(n_tips + 1, n_tips + 2), tree$edge)
+  tree$edge.length <- c(branch_length, tree$edge.length)
+  tree$Nnode <- tree$Nnode + 1
+  
+  tree
+  
+}
+
+tree <- read.tree("results/scarap/lab.treefile")
+tree <- phangorn::midpoint(tree)
+
+tree_root <- add_rootbranch(tree)
+is_tip <- tree_root$edge[,2] <= length(tree_root$tip.label)
+inner_nodes <- tree_root$edge[!is_tip,2]
+
+genes <- read.csv("data/rib_genes_best_hits.csv")
+
+gene_hits <- read.csv("data/rib_genes_best_hits.csv")
+
+classif <- read.csv("data/classifications.csv") %>% rename(label=isolate)
+
+
+vitro <- readr::read_table("data/in_vitro_meas.tsv") %>% rename(label=Strain)
+hplc <- vitro %>% select(label, Conc_HPLC, SD_conc, OD600_hplc, SD_OD_hplc) %>% filter(!is.na(Conc_HPLC))
+# correct labeling mismatches
+vitro <- vitro %>% mutate(
+    label = case_when(
+        label == "AMBV-0961" ~ "AMBV-0961-G",
+        label == "AMBV-0815" ~ "AMBV-0815-A",
+        label == "AMBV-0347-A" ~ "AMBV-0347",
+        label == "AMBV-0318" ~ "AMBV-0318-B",
+        label == "AMBV-0050" ~ "AMBV-0050-V50",
+        TRUE ~ label
+    )
+)
+
+```
+
+```{r}
+
+tree_root$tip.label <- tree_root$tip.label %>% str_replace("COL_M","AMBV-3034")
+
+missing_ambs <- tree_root$tip.label[!tree_root$tip.label %in% genes$isolate]
+
+tree_root <- tree_root %>% 
+drop.tip(missing_ambs)
+
+p <- ggtree(tree_root, layout="circular", open.angle=12) %<+% classif + 
+geom_tippoint(aes(color=species_classified)) + scale_color_manual(values=c25) +
+geom_tiplab2(aes(label=label), align=T, linetype=NA, 
+              size=2, offset=3.4, hjust=0.5)
+```
+
+
+# Wrangling in-vitro data
+```{r}
+
+fluo_data <- vitro %>% 
+  rename(Fluo = Fluo_top) %>%
+  select(Fluo,label) 
+
+gene_hits <- gene_hits %>% 
+select(rib_target,sequence_identity,isolate) %>%
+rename(label=isolate) %>% 
+pivot_wider(names_from="rib_target", values_from="sequence_identity")
+
+gene_hits <- gene_hits %>% 
+full_join(fluo_data)
+
+gene_hits <- gene_hits %>% 
+full_join(hplc)
+labs <- gene_hits$label
+
+gene_hits <- gene_hits %>% 
+select(-label) %>% as.data.frame()
+rownames(gene_hits) <- labs
+
+# gene_pres$HPLC <- ifelse(is.na(gene_pres$HPLC), "0", as.character(gene_pres$HPLC))
+# gene_pres$Fluo <- ifelse(gene_pres$Fluo, "Fluo", 0)
+
+genes %>% left_join(classif, by=c("isolate"="label")) -> genes
+
+genes_p_sp <- genes %>%
+group_by(species_classified)
+
+plot_genes <- function(df){
+ggplot(df, aes(xmin=qstart,xmax=qend,y=contig, fill=rib_target, label=rib_target)) +
+gggenes::geom_gene_arrow() +
+gggenes::geom_gene_label() +
+facet_wrap(isolate~contig, scales="free") + 
+gggenes::theme_genes() +
+scale_fill_brewer(palette = "Set3") +
+ylab("") +
+theme(axis.text.y=element_blank())
+}
+
+gene_plots <- genes_p_sp %>% 
+group_map(~plot_genes(.))
+
+ambv_0339 <- genes %>% filter(isolate=="AMBV-0339")
+ambv_0339$segments <- str_c("cluster ",ambv_0339$qstart %>% cut(3) %>% as.integer())
+
+svglite::svglite("ambv0339-rib_genes.svg")
+plot_genes(ambv_0339) + facet_wrap(~segments, scales="free_x", nrow=3)
+dev.off()
+plot_genes(genes %>% filter(isolate == "AMBV-0339", rib_target %in% c("ribT","ribU")))
+
+#plot_genes(genes %>% filter(species_classified == "s__Limosilactobacillus reuteri", sequence_identity > .9))
+
+p <- rotate_tree(p, -102)
+
+gh <- gheatmap(p, gene_hits %>% select(starts_with('rib')), colnames_angle=0, font.size=2.4,low="#C2D4DB", high="#3F6A79",legend_title="% AA identity") +  
+#scale_fill_gradientn(limits = c(.7,1), colors=c("white","pink")) + 
+scale_y_continuous(expand=c(0, 5))
+
+ghn <- gh + 
+ggnewscale::new_scale_fill()
+
+fluo_data <- as.data.frame(fluo_data)
+row.names(fluo_data) <- fluo_data$label
+ghnN <- gheatmap(ghn,fluo_data %>% select(Fluo), offset=1.75, colnames_angle=0, width=.20, font.size=2.4, legend_title="fluorescence measured", high="#E36588", low="#C7A8E1")
+
+ghnNN <- ghnN + ggnewscale::new_scale_fill()
+
+hplc <- hplc %>%
+   as.data.frame()
+rownames(hplc) <- hplc$label
+
+final_tree <- gheatmap(ghnNN, hplc %>% rename(HPLC=Conc_HPLC) %>% select(HPLC), width=.20, offset=2.1, colnames_angle=0, font.size = 2.4, legend_title="detected by HPLC (µg/mL)", high="#3A0160", low="#CC95AC")
+
+svglite::svglite("tree_again.svg")
+final_tree
+dev.off()
+final_tree
+
+gene_hits %>% 
+rownames_to_column(var="label") %>% left_join(hplc) %>% 
+left_join(fluo_data) %>% left_join(classif) -> all_data_tree
+
+all_data_tree %>% 
+filter(!is.na(species_classified)) %>%
+write_csv("all_data_tree.csv")
+```

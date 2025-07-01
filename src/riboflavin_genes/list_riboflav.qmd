@@ -1,0 +1,393 @@
+# Merge EGGNOG annotations for each isolate into a big table
+```{python}
+import os
+import io
+
+import numpy as np
+import pandas as pd
+from Bio import Phylo
+
+import labkey
+from labkey.api_wrapper import APIWrapper
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import seaborn as sns
+#import colorcet as cc
+
+res = os.listdir("../results")
+res_f = [f"../results/{f}" for f in res if f.endswith(".annotations")]
+
+with open(res_f[0]) as f:
+    content = f.readlines()
+
+colnames = content[4].replace("\n", "").replace("#", "").split("\t")
+
+res_data = [pd.read_table(f, comment="#", names=colnames) for f in res_f]
+
+for f, df in zip(res_f, res_data):
+    df["isolate"] = f.split("/")[-1].split("_")[0]
+
+
+df = pd.concat(res_data)
+
+df.to_csv("fermen_eggnog.csv")
+df["KEGG_Module"].unique()
+
+import pandas as pd
+
+df = pd.read_csv("fermen_eggnog.csv")
+
+my_modules = ["M00125","Mwhatever"]
+
+df_selection = df[df["KEGG_Module"].str.contains("|".join(my_modules))]
+
+```
+
+# Load keggIds of interest and filter the dataframe
+
+```{python}
+
+kegg = pd.read_table("/home/tim/Projects/ongoing/vitamins/riboflav_kegg", names=["kegg_id", "gene"])
+
+kegg_set = set(["ko:" + k for k in kegg["kegg_id"]])
+
+
+df_kegg = df.loc[df["KEGG_ko"].isin(kegg_set)]
+
+# folE also has hits with K21064
+df_kegg = df_kegg[df_kegg["Preferred_name"] != "folE"]
+
+df_kegg.groupby("isolate").size()
+
+coi = ["isolate", "Preferred_name", "Description", "GOs", "EC", "riboflav_group", "KEGG_ko", "COG_category", "PFAMs", "evalue"]
+
+df_kegg["riboflav_group"] = df_kegg["Preferred_name"]
+
+df_kegg.loc[df_kegg["riboflav_group"].isin(["ribA","ribB","ribBA"]), "riboflav_group"] = "ribB/ribA/ribBA"
+
+df_kegg.loc[df_kegg["riboflav_group"] == '-', "riboflav_group"] = df_kegg.loc[df_kegg["riboflav_group"] == '-']['KEGG_ko'].str.split(":").str[1]
+
+#df_kegg[coi].to_csv("kegg_hits.tsv",sep="\t", index=False)
+
+```
+
+# Load the species classification from LabKey and merge it with the KEGG hits
+```{python}
+
+api = APIWrapper('143.129.141.185:8080', 'home/Isolates', 'labkey', use_ssl=False)
+
+my_results = api.query.select_rows(
+    schema_name='lists',
+    query_name='Assemblies'
+)
+
+classif = pd.DataFrame(my_results['rows']).sort_values("checkM.completeness", ascending=False).groupby("isolate").first().reset_index()[["isolate", "species_classified"]]
+
+classif = classif[classif["isolate"].str.startswith("AMBV")]
+
+if not "species_classified" in df_kegg.columns:
+    df_kegg = df_kegg.merge(classif, on="isolate")
+
+df_kegg = df_kegg.loc[df_kegg["species_classified"] != "Unclassified"]
+
+lut = dict(
+    zip(
+        df_kegg["species_classified"].unique(), 
+        sns.color_palette(cc.glasbey, n_colors=25)[:df_kegg["species_classified"].nunique()]
+    ))
+row_colors = df_kegg.groupby("isolate").first()["species_classified"].map(lut)
+
+kegg_counts = df_kegg.pivot_table(index="isolate", columns="riboflav_group", values="evalue", aggfunc="count").fillna(0)
+
+# add numbers when >1 
+annotations = np.empty_like(kegg_counts, dtype=str)
+annot_mask = kegg_counts > 1
+annotations[annot_mask] = \
+kegg_counts.to_numpy()[annot_mask].astype(int).astype(str)
+
+#df_kegg[["isolate", "species_classified"]].drop_duplicates().to_csv("../data/classifications.csv",index=False)
+
+```
+
+# Phylogenetic tree clustering
+
+```{r}
+
+library(ggtree)
+library(ape)
+
+#treefile = "../vitamins-fleet-eggnogmapper/scarap/lab.treefile"
+#tree = read.tree(treefile)
+# tree_ch = chronos(tree)
+# write.tree(tree_ch, "scarap/lab_chronos.tree")
+tree <- read.tree("scarap/lab_chronos.tree")
+tree <- tree %>% ladderize(right=F)
+#tree$tip.label
+svg("lab_tree.svg", width=10, height=20)
+tree %>% ggtree()
+dev.off()
+
+tree$tip.label %>% write.table("scarap/lab_tips_ladderized.tsv", sep="\t", quote=F, col.names=c("isolate"), row.names=F)
+
+```
+
+# Plotting the KEGG hits
+
+## Riboflavin
+
+```{python}
+# plotting 
+
+sns.set(rc={'figure.figsize':(12,28)})
+
+# arrange by label order:
+order_taxa = pd.read_table("../scarap/lab_tips_ladderized.tsv")
+
+kegg_counts_ord = kegg_counts.reindex(order_taxa.isolate)
+
+kegg_counts_ord = kegg_counts_ord.fillna(0)
+
+kegg_counts_bin = np.where(kegg_counts_ord > 0, 1, 0)
+kegg_counts_bin = pd.DataFrame(kegg_counts_bin , columns=kegg_counts_ord.columns,index=kegg_counts_ord.index)
+
+kegg_counts_bin.to_csv("../data/bin_gene_counts.csv")
+
+cl = sns.clustermap(data=kegg_counts_bin, vmin=0, 
+row_colors=row_colors, fmt="", 
+row_cluster=False,
+method="ward",
+cmap=sns.light_palette("#00719A", as_cmap=True),
+cbar_pos= None, 
+cbar_kws={"orientation": "horizontal", "ticks":[0,1,2,3,4,5,6]},
+yticklabels=1)
+
+kegg_counts_ord.to_csv("hmp.tsv", sep="\t", index=True)
+
+cl.tick_params(axis='y', labelsize=2)
+cl.tick_params(axis='x', rotation=-20)
+
+handles = [Patch(facecolor=lut[label]) for label in lut]
+
+plt.legend(handles, lut, title='Species',
+           bbox_to_anchor=(0.98, 0.3), bbox_transform=plt.gcf().transFigure, loc='lower left')
+
+plt.savefig("kegg_hits.svg", dpi=300, bbox_inches="tight")
+plt.show()
+
+```
+
+```{python}
+
+kegg_presence = pd.DataFrame(np.where(kegg_counts > 0, 1, 0))
+
+kegg_presence.index = kegg_counts.index
+
+kegg_presence.sum(axis=1).sort_values(ascending=False).to_csv("top_hits.csv")
+
+```
+
+
+
+```{python}
+# public counts from annotree
+df_pub = pd.read_csv("../data/annotree_hits_lacto.csv")
+#df_lactos = df_pub.loc[df_pub.family == "Lactobacillaceae"]
+#df_lactos.to_csv("data/annotree_hits_lacto.csv")
+
+
+kegg_counts_pub = df_pub.pivot_table(index="gtdbId", columns="keggId", values="species", aggfunc="count").fillna(0)
+
+lutp = dict(
+    zip(
+        df_pub["species"].unique(), 
+        sns.color_palette(cc.glasbey, n_colors=40)[:df_pub["species"].nunique()]
+    ))
+
+row_colors_pub = df_pub.groupby("gtdbId").first()["species"].map(lutp)
+
+clp = sns.clustermap(data=kegg_counts_pub, vmin=0, 
+#annot=annotations, 
+row_colors=row_colors_pub, fmt="", 
+#row_linkage=linkage_matrix_lactos,
+cmap=sns.cubehelix_palette(start=4, rot=0, dark=0.8, light=1, as_cmap=True),
+cbar_pos= [0.2, 1, 0.65, 0.05], 
+cbar_kws={"orientation": "horizontal", "ticks":[0,1,2,3,4,5,6]},
+yticklabels=1)
+
+clp.tick_params(axis='y', labelsize=2)
+clp.tick_params(axis='x', rotation=-20)
+
+handles = [Patch(facecolor=lutp[label]) for label in lutp]
+
+plt.legend(handles, lutp, title='Species',
+           bbox_to_anchor=(0.98, 0.3), bbox_transform=plt.gcf().transFigure, loc='lower left')
+
+```
+
+
+```{r ggtree}
+library(tidyverse)
+library(ggtree)
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+  "green4",
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "black", "gold1",
+  "skyblue2", "#FB9A99", # lt pink
+  "palegreen2",
+  "#CAB2D6", # lt purple
+  "#FDBF6F", # lt orange
+  "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+
+add_rootbranch <- function(tree, branch_length = 1) {
+  
+  n_tips <- length(tree$tip.label)
+  tree$edge[tree$edge > n_tips] <- tree$edge[tree$edge > n_tips] + 1
+  tree$edge <- rbind(c(n_tips + 1, n_tips + 2), tree$edge)
+  tree$edge.length <- c(branch_length, tree$edge.length)
+  tree$Nnode <- tree$Nnode + 1
+  
+  tree
+  
+}
+
+tree <- read.tree("../vitamins-fleet-eggnogmapper/scarap/lab.treefile")
+tree <- phangorn::midpoint(tree)
+
+tree_root <- add_rootbranch(tree)
+is_tip <- tree_root$edge[,2] <= length(tree_root$tip.label)
+inner_nodes <- tree_root$edge[!is_tip,2]
+gene_pres <- read.csv("data/bin_gene_counts.csv")
+classif <- read.csv("data/classifications.csv") %>% rename(label=isolate)
+vitro <- readr::read_table("data/in_vitro_meas.tsv") %>% rename(label=Strain)
+
+rownames(gene_pres) <- gene_pres$isolate
+gene_pres <- gene_pres %>% select(-isolate,-ribC1)
+
+heatmap.colors <- c("gray","#255262", "#3F6A79", "#487C8F", "#6692A2", "#86A8B6", "#FFED66","#EE8434", "white", "#EE8434", "#EDEBA0")
+names(heatmap.colors) <- c(names(gene_pres), "Fluo", "HPLC", "0", "> 0.2", "< -0.2")
+
+
+p <- ggtree(tree_root, layout="circular", open.angle=12) %<+% classif + 
+geom_tippoint(aes(color=species_classified)) + scale_color_manual(values=c25) +
+geom_tiplab2(aes(label=label), align=T, linetype=NA, 
+              size=2, offset=2.5, hjust=0.5)
+
+gene_pres[gene_pres == 1] <- NA
+
+gene_pres$ribF <- as.character(gene_pres$ribF) %>% 
+replace_na("ribF")
+gene_pres$K20861 <- as.character(gene_pres$K20861) %>% 
+replace_na("K20861")
+gene_pres$ribB.ribA.ribBA <- as.character(gene_pres$ribB.ribA.ribBA) %>% 
+replace_na("ribB.ribA.ribBA")
+gene_pres$ribH <- as.character(gene_pres$ribH) %>% 
+replace_na("ribH")
+gene_pres$ribD <- as.character(gene_pres$ribD) %>% 
+replace_na("ribD")
+gene_pres$ribE <- as.character(gene_pres$ribE) %>% 
+replace_na("ribE")
+
+# correct labeling mismatches
+vitro <- vitro %>% mutate(
+    label = case_when(
+        label == "AMBV-0961" ~ "AMBV-0961-G",
+        label == "AMBV-0815" ~ "AMBV-0815-A",
+        label == "AMBV-0347-A" ~ "AMBV-0347",
+        label == "AMBV-0318" ~ "AMBV-0318-B",
+        label == "AMBV-0050" ~ "AMBV-0050-V50",
+        TRUE ~ label
+    )
+)
+
+fluo_data <- vitro %>% 
+  mutate(Fluo = Fluo_top > 0) %>%
+  select(Fluo,label) 
+
+gene_pres$label <- row.names(gene_pres)
+gene_pres <- gene_pres %>% 
+left_join(fluo_data)
+
+gene_pres$Fluo <- ifelse(is.na(gene_pres$Fluo), FALSE, gene_pres$Fluo)
+rownames(gene_pres) <- gene_pres$label
+
+hplc <- vitro %>% mutate(HPLC = as.factor(case_when(
+    Conc_HPLC > .2 ~ "> 0.2",
+    Conc_HPLC > -.2 ~ "0.2 - (-0.2)",
+    Conc_HPLC < -.2 ~ "< -0.2",
+    TRUE ~ "0"
+))) %>% 
+select(HPLC,label) 
+
+
+gene_pres <- gene_pres %>% left_join(hplc)
+rownames(gene_pres) <- gene_pres$label
+
+gene_pres$HPLC <- ifelse(is.na(gene_pres$HPLC), "0", as.character(gene_pres$HPLC))
+gene_pres$Fluo <- ifelse(gene_pres$Fluo, "Fluo", 0)
+
+gh <- gheatmap(p, gene_pres, colnames_angle=90, font.size=2.4) + 
+scale_fill_manual(values=heatmap.colors, breaks=0) + guides(fill="none") + scale_y_continuous(expand=c(0, 5))
+
+ghn <- gh + ggnewscale::new_scale_fill()
+ghnN <- gheatmap(ghn,fluo_data, offset=1.8, colnames_angle=90, width=.2, font.size=3, legend_title="fluorescence measured") + scale_fill_viridis_c(option="magma", na.value="white")
+
+ghnNN <- ghnN + ggnewscale::new_scale_fill()
+hplc_data <- vitro %>% 
+  select(Conc_HPLC) %>%
+  rename(HPLC=Conc_HPLC) %>%
+   as.data.frame()
+rownames(hplc_data) <- vitro$label
+
+gheatmap(ghnNN, hplc_data, width=.2, offset=2.4, colnames_angle=90, font.size = 3, legend_title="detected by HPLC (µg/mL)") +
+scale_fill_viridis_c(option="mako",na.value="white")
+
+vitro <- vitro %>% left_join(classif) %>% rename(species=species_classified)
+
+svglite::svglite("tree_rib_genes.svg")
+gh
+dev.off()
+
+library(ggtreeExtra)
+svglite::svglite("tree_rib_genes_isolates_alt.svg")
+ghn + ggnewscale::new_scale_fill() +
+geom_fruit(
+    data=vitro,
+    geom=geom_bar,
+    mapping=aes(y=label, x=Fluo_top),
+    stat='identity',
+    orientation='y',
+    pwidth=.4,
+    offset=.75,
+    fill="yellow"
+) + ggnewscale::new_scale_fill() +
+geom_fruit(
+    data=vitro,
+    geom=geom_bar,
+    mapping=aes(y=label, x=Conc_HPLC),
+    stat="identity",
+    orientation="y",
+    pwidth=.4,
+    fill="orange",
+    offset=-.9
+)
+dev.off()
+#viewClade(p, node=501) + geom_tiplab(size=10)
+
+vitro %>% select(label, Fluo_top, Conc_HPLC) -> vitro_vals
+
+gene_pres$label <- row.names(gene_pres)
+gene_pres %>% left_join(vitro_vals) %>% write_csv("riboflavin_genes_per_isolate.csv")
+
+
+```
+
+
+

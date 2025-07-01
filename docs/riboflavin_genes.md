@@ -25,4 +25,5 @@ On a file containing one .faa file per line will construct a phylogenetic tree o
 
 ## Analysis of the results
 
-The annotations from the eggnog database are then collected and processed using two quarto script (src/list_riboflav.qmd and src/list_fleet.qmd).
+The annotations from the eggnog database are then collected and processed using two quarto script (src/list_riboflav.qmd and src/viz_tree.qmd).
+
