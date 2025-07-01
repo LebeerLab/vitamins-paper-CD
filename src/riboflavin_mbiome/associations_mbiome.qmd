@@ -1,0 +1,521 @@
+---
+title: Association Riboflavin Intermediates with Microbiome
+author: "Tim Van Rillaer"
+date: "13/06/2024"
+format:
+  html: 
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 2
+    toc_smooth_scroll: false
+    code_folding: true
+    theme: journal
+    embed-resources: true
+---
+
+
+# Filter to riboflavin intermediates
+```{python, adapt-quant-table}
+#| eval: false
+
+import re
+import pandas as pd
+
+quant = pd.read_csv("data/Quant_Table_BigBatch_Processed_20250120.csv")
+vitamins = pd.read_excel("data/Table vitamins.xlsx").dropna()
+
+quant = quant.set_index("sample").T.reset_index(names=["compound"])
+
+regex = "(" +"|".join(vitamins["quant_table_n"].apply(re.escape)) + ".*)"
+key = quant["compound"].str.extract(regex)
+
+quant_filtered = vitamins.merge(quant.assign(key=key), left_on="quant_table_n", right_on="key").drop(columns=['quant_table_n','key'])
+
+quant_filtered.to_csv("data/Quant_table_vitamins.csv", index=False)
+
+```
+
+# Presence Absence vitamins
+
+```{r}
+library(tidyverse)
+library(tidytacos)
+require(GGally)
+require(janitor)
+
+folder_tidyamplicons <- "data/isala_long_amplicon_20220623"
+folder_tidytacos_flow1 <- "data/cross"
+
+ms_data <- "data/Quant_table_vitamins.csv"
+ms_data_labels <- "data/Shipping time Flow 1-2.BoxCodes_SC.xlsx"
+
+ta <- read_tidytacos(folder_tidyamplicons)
+ta$samples$flow <- "Flow2"
+ta <- ta %>% filter_samples(nonredundant) %>%
+  filter_samples(endsWith(description, "S2"))
+ta$samples$participant <-  str_sub(ta$samples$description,0,10)
+
+ta_flow1 <- read_tidytacos(folder_tidytacos_flow1)
+ta_flow1$samples$flow <- "Flow1"
+ta <- ta %>% merge_tidytacos(ta_flow1, taxon_identifier=taxon)
+
+# reclassification
+ta %>% filter_taxa(genus %in% c("Prevotella", "Lactobacillus", "Bifidobacterium", "Gardnerella")) %>% classify_taxa("data/ssu_r214_lactobacillus_prevotella_bifido_subgenera.fna", sequence_var = "taxon") %>% select_taxa(-domain) -> ta_bif_prev
+
+rows_update(ta$taxa, ta_bif_prev$taxa, by="taxon_id") -> ta$taxa 
+
+ta <- ta %>% aggregate_taxa(rank="genus")
+
+presence <- read.csv(ms_data,sep=",")
+meas <- presence[,-c(1,2,3,4,5)] %>% t
+meas.labels <- presence[,c(1,2,3,4,5)]
+colnames(meas) <- presence$Name 
+presence <- as.data.frame(meas)
+presence %>% janitor::clean_names() -> presence
+presence <- rownames_to_column(presence, var="sample")
+# these are all HILICMSneg and DS001B; 
+# so lets remove that part of the sample name
+presence$flow <- str_extract(presence$sample, "Flow.")
+presence$sample <- presence$sample %>% 
+  str_remove("_Flow._HILICMSneg.*") %>%
+  str_remove(".*_Box")
+
+presence.labs <- readxl::read_excel(ms_data_labels) %>% 
+  janitor::clean_names()
+
+presence.labs <- presence.labs %>% mutate(
+  box_code_flow2 = paste0(
+    as.integer(str_extract(box_code_flow2, "[0-9]"))-4,
+    str_extract(box_code_flow2, "_[0-9]*")
+  )
+)
+fetch_sample_name <- function(lab, flow){
+    
+    if (flow == "Blank") {
+        return(flow)
+    }
+    else if (flow == "Flow1") {
+        i <- which(presence.labs$box_code_flow1 == lab)
+    } else if (flow=="Flow2") {
+        i <- which(presence.labs$box_code_flow2 == lab)
+    } else {
+        stop("No flow detected")
+    }
+
+    if (length(i)==0) {
+        warning(paste("Sample", lab,"not found in", flow))
+        return(NA)
+    }
+    return(presence.labs$isala_id[i])
+}
+
+presence <- presence %>% 
+mutate(
+    flow = ifelse(is.na(flow), "Blank", flow)
+)
+
+presence$isala_id <- map2(
+   presence$sample, presence$flow, fetch_sample_name
+) %>% unlist() 
+
+#colnames(presence) <- colnames(presence) %>% str_trunc(20,ellipsis="")
+
+presence.labels <- meas.labels %>% mutate(clean_name= janitor::make_clean_names(Name))
+
+```
+
+```{r}
+#| fig-height: 16
+#| fig-width: 16
+library(GGally)
+
+blanks <- presence %>% filter(flow=="Blank")
+
+blanks$no <- blanks$sample %>% str_extract("_(..?)_", group=1) %>% as.integer()
+
+ta$samples <- ta$samples %>% left_join(presence %>% select(-sample), by=c("participant"="isala_id", "flow"="flow")) 
+
+ta <- ta %>% filter_samples(!is.na(riboflavin_5_monophosphate))
+#ta$samples$issues
+
+pres.cols <- presence %>% colnames()
+compound_names <- pres.cols[grep('isala_id|flow|sample', pres.cols, invert=TRUE)]
+ta$samples %>% mutate_at(compound_names, as.numeric) -> ta$samples
+ta$samples <- ta$samples %>% drop_na(any_of(compound_names))
+ta$counts %>% filter(sample_id %in% ta$samples$sample_id) -> ta$counts
+
+#presence %>% select(-sample,-isala_id) %>% 
+#ggpairs(aes(color=flow, alpha=.6),
+#upper = list(continuous = wrap("cor", size = 2.5))) + theme(strip.text.x = element_text(size = 4),
+#           strip.text.y = element_text(size = 4))
+
+```
+
+# Substracting blancos from the measurements
+
+```{r}
+#| fig-width: 16
+compounds <- presence %>% 
+ select(-sample,-isala_id,-sample,-flow) %>% 
+ colnames()
+
+ta_sub <- ta
+
+blanks <- blanks[-1,]
+
+blanks %>% mutate_at(compounds, as.numeric) -> blanks
+
+blanks %>%  select(-flow,-isala_id,-no) %>% pivot_longer(!sample) %>% mutate(type="blank") -> blank_long
+
+ta$samples %>% 
+select(dplyr::any_of(colnames(blanks)),participant,-sample) %>% 
+pivot_longer(!c(participant,flow)) %>% 
+mutate(type="sample") -> sample_long
+
+sum_blank_p_sample <- blank_long %>% 
+group_by(sample) %>% 
+summarize(tic=sum(value))
+mean_blank_p_sample <- blank_long %>% 
+group_by(sample) %>% 
+summarize(mean_intensity=mean(value)) 
+
+summary_blanks <- sum_blank_p_sample %>% mutate(tic_log = log(tic, 2)) %>% left_join(mean_blank_p_sample)
+
+
+knitr::kable(summary_blanks)
+tolerance <- min(summary_blanks$mean_intensity)*5
+
+theGoodBlanks <- summary_blanks %>% filter(mean_intensity < tolerance)
+
+summary_blanks %>% ggplot(aes(y=mean_intensity, x=tic)) + geom_point() + ggplot2::geom_hline(yintercept=tolerance, color="red", linetype="dashed") + theme_classic()
+
+blanks %>% filter(sample %in% theGoodBlanks$sample) -> blanks
+
+blank_long %>% filter(sample %in% theGoodBlanks$sample) -> blank_long
+
+sample_long$sample <- paste(sample_long$participant,sample_long$flow, sep="_")
+sample_long <- sample_long %>% 
+select(-participant, -flow)
+avg_blank_vs_sample <- rbind(blank_long, sample_long) %>% group_by(name, type) %>% summarize(avg_intensity=mean(value)) %>% group_by(name) %>% summarize(blank_v_sample = avg_intensity[type=="blank"]/avg_intensity[type=="sample"])
+
+avg_blank_vs_sample %>% filter(blank_v_sample > .3) -> noise
+
+rbind(blank_long, sample_long) %>%
+left_join(noise) %>% 
+mutate(is_noise=ifelse(is.na(blank_v_sample), "<30% BG detected", ">30% BG detected (noise)")) %>%
+arrange(desc(type)) %>%
+ggplot(aes(x=value,y=name,col=type)) + geom_jitter() + 
+scale_x_continuous(trans="log10") + 
+facet_wrap(~is_noise, scale="free_y") +
+theme_classic()
+
+ta %>% select_samples(-noise$name) -> ta
+compounds <- compounds[!compounds %in% noise$name]
+
+# remove isotope duplicate compounds
+compound_dup <- c("riboflavin_m_cl_2","riboflavin_m_cl_3", "nicotinic_acid_2", 
+"x5_2_oxoethylideneamino_6_d_ribitylaminouracil_2",
+"x5_2_oxoethylideneamino_6_d_ribitylaminouracil_3",
+"x5_2_oxoethylideneamino_6_d_ribitylaminouracil_4",
+"x5_2_oxopropylideneamino_6_d_ribitylaminouracil_2",
+"x5_2_oxopropylideneamino_6_d_ribitylaminouracil_4",
+"riboflavin_monophosphate_2",
+"x7_hydroxy_6_methyl_8_1_d_ribityl_lumazine_2",
+"riboflavin_5_monophosphate_2"
+)
+
+ta %>% select_samples(-compound_dup) -> ta
+compounds <- compounds[!compounds %in% compound_dup]
+
+ta_sub <- ta
+
+for (compound in compounds) {
+    ta_sub$samples[[compound]] <- ta_sub$samples[[compound]] - max(blanks[[compound]])
+}
+
+ta_sub$samples %>% mutate_if(is.numeric, funs(ifelse(.<0, 0, .))) -> ta_sub$samples
+
+ta_bin <- ta_sub
+for (compound in compounds) {
+    ta_bin$samples[[compound]] <- ta_bin$samples[[compound]] > 0
+}
+
+intermediates <- 
+ta_bin$samples %>% select(all_of(compounds))
+
+summary_interm <- tibble(val = apply(intermediates, 2, sum, na.rm=T)) 
+summary_interm$key <- c(compounds)
+
+summary_interm <- summary_interm %>% 
+rename(clean_name=key) %>% 
+left_join(presence.labels) %>% 
+mutate(Color=paste0("#", Hex.code)) %>% 
+select(-Hex.code)
+
+summary_interm$Class <- summary_interm$Class %>% trimws()
+
+summary_interm$Cat <- paste("Vitamin", summary_interm$Class %>% str_split_i(" ", 2))
+
+summary_interm$Cat[22] <- "Quinone"
+summary_interm$Cat[23] <- "Quinone"
+
+summary_interm %>% mutate(Abbreviation = if_else(Abbreviation == "/", Name, Abbreviation)) -> summary_interm
+
+color_guide <- split(summary_interm$Color, summary_interm$clean_name)
+svglite::svglite("figures/vitamin-counts.svg")
+ggplot(summary_interm, aes(x=val, y=reorder(Abbreviation, val))) +
+  geom_bar(stat="identity",
+   aes(fill=clean_name), position="dodge2") +
+  scale_colour_manual(values=color_guide, aesthetics = c("colour", "fill")) +
+  geom_text(aes(label=val)) +
+   ggtitle(paste("Intermediates detected in", length(ta_bin$samples$sample), "samples.")) + xlab("Number of samples intermediate has higher signal than blanks") + ylab("Intermediate") + 
+  theme_classic() +
+  facet_wrap(~Cat, scale="free_y",
+  ncol=1, strip.position="left") +
+  theme(legend.position = "none",
+  strip.background = element_blank(), strip.placement = "outside")
+dev.off()
+
+compounds <- compounds[compounds!="hydroquinone"]
+cols <- ta_sub$samples %>% colnames()
+cols[22:54]
+ta_sub$samples %>% select(description, cols[22:54]) %>% openxlsx::write.xlsx("blank_substracted.xlsx")
+
+```
+
+
+# Sample centric normalization
+```{r}
+
+ta_sub$samples$tic <- ta_sub$samples[compounds] %>% rowSums()
+ta_norm <- ta_sub
+ta_norm$samples[compounds] <- ta_norm$samples[compounds]/ta_norm$samples$tic
+
+#low_prevalent_ions <- which(colSums(ta_norm$samples[compounds] <= 0)/length(ta_norm$samples$sample_id) < 0.05) %>% names()
+
+# pcoa of metabolites
+M <- ta_norm$samples %>% 
+select(compounds) %>% 
+#select(-low_prevalent_ions) %>%
+as.matrix()
+rownames(M) <- ta_norm$samples$sample_name
+M_scale <- scale(M, scale=T, center=T)
+
+dM <- dist(M_scale, method="euclidean")
+
+pcoa <- cmdscale(dM, k=4, eig=T, add=T, x.ret=T, list.=T)
+pcoa.pts <- pcoa$points %>% as_tibble()
+pcoa.var <- round(pcoa$eig*100/sum(pcoa$eig), 1)
+
+pcoa.pts %>% ggplot(aes(x=V1, y=V2)) + geom_point(aes(col=ta_norm$samples$flow))
+
+res.adonis <- vegan::adonis2(dM ~ ta_norm$samples$flow + ta_norm$samples$lib_size + ta_norm$samples$tic + ta_norm$samples$participant, by="margin")
+# -> large effect of flow on samples (as was expected) and marginal but signif effect of tic
+
+ta_scaled <- ta_norm
+rownames(M_scale) <- ta_scaled$sample_id
+ta_scaled$samples[compounds] <- M_scale %>% as_tibble()
+
+```
+
+
+```{r}
+
+library(kableExtra)
+
+ta_bin %>% set_rank_names(c("kingdom","phylum","class","order","family","genus","species")) -> ta_bin
+
+ta_bin_g <- ta_bin %>% aggregate_taxa(rank="genus")
+
+ta_scaled %>% remove_empty_samples() -> ta_scaled
+
+ta_scaled %>% select_samples(lib_size,flow,participant,sample_id,compounds) -> ta_scaled
+
+svglite::svglite("figures/corr_metabolites.svg")
+cor.scale <- cor(M_scale)
+corrplot::corrplot(cor.scale, col=corrplot::COL2("PRGn"), type="lower", tl.col="black", cl.ratio=.1, tl.srt=50)
+dev.off()
+
+compounds <- compounds[compounds != "coenzyme_q10"]
+
+ta_scaled %>% add_alphas() -> ta_scaled
+
+corr_alpha <- rstatix::cor_test(ta_scaled$samples %>% select(compounds, #obs, 
+shannon, lib_size), vars=c(
+  #"obs", 
+  "shannon"), vars2=c(compounds#, "lib_size"
+  ))
+
+show_signif <- function(x) {
+
+  if (x > .05) { return("") }
+  if (x > .01) { return("*") }
+  if (x < .005) { return("**") }
+  "***" 
+}
+
+corr_alpha <- corr_alpha %>% mutate(p_sig= corr_alpha$p %>% #p.adjust() %>% 
+sapply(show_signif)) 
+
+svglite::svglite("figures/alpha_correlation.svg")
+corr_alpha %>% mutate(var2=forcats::fct_reorder(var2, cor)) %>%
+ggplot(aes(y=var2,x=cor)) + 
+geom_point(aes(col=cor<0)) + 
+geom_errorbar(aes(xmin=conf.low, xmax=conf.high), width=.1, color="darkgrey")+
+geom_vline(xintercept=0, linetype="dashed", color="lightgrey") +
+geom_text(aes(label=p_sig)) +
+facet_wrap(~var1) + 
+scale_color_manual(values=c("#E36588","#9AC4F9")) +
+theme_classic()
+dev.off()
+
+```
+
+# modules
+```{r}
+
+crispatus <- c("Lactobacillus crispatus group","Lactobacillus jensenii group", "Limosilactobacillus")
+bacteroides <- c("Blautia", "Bacteroides", "Faecalibacterium")
+gardnerella <- c("Atopobium", "KQ959671", "Aerococcus", "Megasphaera", "KQ959578", "Sneathia", "Gardnerella", "Gemella", "Parvimonas")
+prevotella <- c("Dialister", "Prevotella", "Anaerococcus", "Actinomyces", "Staphylococcus", "Corynebacterium", "Peptoniphilus", "Peptostreptococcus", "CPOO9312", "Finegoldia", "Fenollaria", "Campylobacter", "Ezakiella", "Porphyromonas")
+
+ta_scaled$taxa <- ta_scaled$taxa %>% mutate(
+  module = if_else(taxon_name %in% crispatus, "crispatus module", if_else(taxon_name %in% bacteroides , "bacteroides module", if_else(taxon_name %in% prevotella, "prevotella module", if_else(taxon_name %in% gardnerella, "gardnerella module", "other"))))
+)
+
+ta_modules <- ta_scaled
+ta_modules %>% set_rank_names("module") %>% aggregate_taxa(rank="module") -> ta_modules 
+
+fml <- "~riboflavin_5_monophosphate+x6_7_dimethylribityl_lumazine+riboflavin_m_h"
+
+
+
+```
+
+# topic modeling
+```{r}
+set.seed(42)
+
+lda <- perform_lda(ta_scaled, k=9, taxon=taxon_name)
+
+topics <- lda$topics %>% 
+    as_tibble() %>% 
+    janitor::clean_names()
+
+topics$sample_id <- rownames(lda$topics)
+
+topics.names <- lapply(1:9, function(x) paste(which(lda$terms[x,] > .1) %>% names(), collapse=",")) %>% unlist()
+
+ta_scaled$samples <- ta_scaled$samples %>% 
+left_join(topics)
+
+plot_topic_metabolite_associations_by_flow <- function(flow="Flow2") {
+
+  tt_flow <- ta_scaled %>% filter_samples(flow==flow)
+
+  fml <- paste("~", paste(compounds,collapse="+"))
+  topics.sym <- paste0("x", 1:9)
+
+  fmls <- lapply(topics.sym, function(x) as.formula(paste(x,fml)))
+
+  mods <- lapply(fmls, function(x)lm(x, tt_flow$samples))
+
+  Peff <- lapply(mods, function(x)anova(x) %>% pull("Pr(>F)")) %>% lapply(`[`, 1:19)
+
+  fixeff <- lapply(mods, function(x) summary(x)$coefficients[,1])
+  fixeff <- do.call(cbind,fixeff)
+  fixeff <- fixeff[1:20,]
+  colnames(fixeff) <- topics.names
+
+  Peff <- do.call(cbind,Peff) %>% p.adjust(method="fdr") %>% matrix(ncol=9)
+  rownames(Peff) <- compounds[1:19]
+  colnames(Peff) <- colnames(fixeff)
+  Peff.sym <- ifelse(Peff < .01, "**", ifelse(Peff < .05, "*", ""))
+
+  pheatmap::pheatmap(
+      fixeff[-1,] %>% t(), 
+      display_numbers=Peff.sym[-20,] %>% t(), 
+      cluster_cols = T, cluster_rows=T
+      , color = colorRampPalette(c("blue", "white", "red"))(100))
+
+}
+
+
+colnames(topics) <- topics.names
+svglite::svglite("figures/topic_metabolite_associations_flow2.svg")
+plot_topic_metabolite_associations_by_flow()
+dev.off()
+
+svglite::svglite("figures/topic_metabolite_associations_flow1.svg")
+plot_topic_metabolite_associations_by_flow("Flow1")
+dev.off()
+
+topics %>% write_csv("results/topic_weights.csv")
+
+```
+
+```{r}
+ad_res <- ta_scaled %>% perform_adonis(compounds, by="terms", method="aitchison", pseudocount=1)
+```
+
+
+```{r}
+#| fig-width: 12
+
+crisp_relab <- ta_bin_g %>% 
+  add_rel_abundance() %>% 
+  filter_taxa(genus == "Lactobacillus crispatus group") %>%
+  counts() %>% dplyr::select(rel_abundance, sample_id) %>% rename(rel_crispatus = rel_abundance)
+
+iners_relab <- ta_bin_g %>% 
+  add_rel_abundance() %>% 
+  filter_taxa(genus == "Lactobacillus iners group") %>%
+  counts() %>% dplyr::select(rel_abundance, sample_id) %>% rename(rel_iners = rel_abundance)
+
+gasseri_relab <- ta_bin_g %>% 
+  add_rel_abundance() %>% 
+  filter_taxa(genus == "Lactobacillus gasseri group") %>%
+  counts() %>% dplyr::select(rel_abundance, sample_id) %>% rename(rel_gasseri = rel_abundance)
+
+
+ta_bin_g$samples <- ta_bin_g$samples %>% left_join(crisp_relab, by="sample_id")
+ta_bin_g$samples <- ta_bin_g$samples %>% left_join(iners_relab, by="sample_id")
+ta_bin_g$samples <- ta_bin_g$samples %>% left_join(gasseri_relab, by="sample_id")
+
+ta_bin_g$samples <- ta_bin_g$samples %>% mutate(dominance = ifelse(rel_crispatus >0.3, "L. crispatus", ifelse(rel_iners > 0.3, "L. iners", ifelse(rel_gasseri > 0.3 , "L. gasseri", "Other"))))
+ta_bin_g$samples["dominance"][is.na(ta_bin_g$samples["dominance"])] = "Other"
+
+library(ComplexUpset)
+
+compounds_adonis <- rownames(ad_res[which(ad_res$`Pr(>F)` < 0.05),])
+
+samples_w_o_na <- ta_bin_g %>% 
+  select_samples(compounds , sample_id) %>% 
+  samples() %>% 
+  na.omit() %>% 
+  pull(sample_id)
+ta_bin_g <- filter_samples(ta_bin_g, sample_id %in% samples_w_o_na)
+
+svglite::svglite("upset_plot_dominances.svg")
+upset(ta_bin_g$samples,
+      compounds_adonis,
+      sort_intersections_by='ratio',
+      min_size=5,
+      set_sizes=F,
+      annotations = list(
+        "Lactobacillus dominance"=(
+          ggplot(mapping = aes(fill=dominance))
+           + geom_bar(stat="count", position="fill")
+           + scale_y_continuous(labels=scales::percent_format())
+          + scale_fill_manual(
+            values = c("lightpink1", "lightskyblue1", "seagreen3", "grey")
+          )
+           + ylab("Lactobacillus dominance")
+          )
+        )
+      )
+dev.off()
+ta_scaled %>% write_tidytacos("data/tacos_vitamins_scaled")
+
+```

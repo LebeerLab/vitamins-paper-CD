@@ -1,0 +1,349 @@
+``{r}
+#| eval: false
+library(tidyverse)
+library(tidytacos)
+library(multidiffabundance)
+tt <- read_tidytacos("data/tacos_vitamins_scaled")
+fmls <- c(
+"~thiamine",
+"~thiamine_hydrochloride",
+"~riboflavin_m_h",
+"~riboflavin_5_monophosphate",
+"~x7_hydroxy_6_methyl_8_1_d_ribityl_lumazine",
+"~x6_7_dimethylribityl_lumazine",
+"~x5_2_oxoethylideneamino_6_d_ribitylaminouracil",
+"~x5_2_oxopropylideneamino_6_d_ribitylaminouracil",
+"~x5_2_oxopropylideneamino_6_d_ribitylaminouracil_3",
+"~nicotinic_acid",
+"~nicotinuric_acid",
+"~d_pantothenate",
+"~sodium_d_pantothenate",
+"~pyridoxine_h_cl",
+"~biotin",
+"~x4_aminobenzoic_acid",
+"~x5_6_dimethylbenzimadizole",
+"~cyanocobalamine",
+"~retinoic_acid"
+)
+
+fmls %>% write("mda-in/formulas.txt")
+
+ttfl1 <- tt %>% filter_samples(flow == "Flow1")
+ttfl2 <- tt %>% filter_samples(flow == "Flow2")
+
+ttfl2 %>% 
+  counts_matrix(taxon_name = taxon_name) %>% 
+  write.table("mda-in/counts.tsv", sep="\t")
+
+ttfl2$samples %>% 
+select(sample_id, 
+str_replace(fmls, "~", "")) %>%
+write.table("mda-in/samples.tsv", sep="\t", row.names = FALSE)
+
+D <- mda.from_tidytacos(ttfl1,fmls)
+resB <- mda.beta(D)
+resA <- mda.alpha(D)
+resA$res.full %>% rbind(resB$res.full) -> resfl1
+resfl1 %>% write_tsv("mda-out-flow1/results_ab.tsv")
+# adjp
+#res %>% filter(!variable %in% c("mda.beta","mda.shannon.alpha")) %>%
+#mutate(qvalue = p.adjust(pvalue, method = "fdr")) -> resq
+#update_rows(res, resq) 
+
+D2 <- mda.from_tidytacos(ttfl2,fmls)
+resB <- mda.beta(D2)
+resA <- mda.alpha(D2)
+resA$res.full %>% rbind(resB$res.full) -> resfl2
+resfl2 %>% write_tsv("mda-out-flow2/results_ab.tsv")
+
+```
+
+```{python}
+#| eval: false
+import pandas as pd
+import scipy.stats as stats
+
+res_flow1 = pd.read_table("mda-out-flow1/results.tsv")
+res_flow2 = pd.read_table("mda-out-flow2/results.tsv")
+
+def update_qvalues(res):
+    res_taxa = res[~res["taxa"].isin(("mda.beta","mda.shannon.alpha"))].dropna(subset=["pvalue"])
+    res_taxa["qvalue"] = stats.false_discovery_control(res_taxa["pvalue"])
+
+    res.update(res_taxa)
+
+update_qvalues(res_flow1)
+update_qvalues(res_flow2)
+res_flow1.to_csv("mda-out-flow1/results.tsv", sep="\t", index=False)
+res_flow2.to_csv("mda-out-flow2/results.tsv", sep="\t", index=False)
+
+```
+
+```{python, mda-plot, eval=FALSE}
+import os
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pandas import MultiIndex
+import seaborn as sns
+
+class MDAPlot:
+
+    def __init__(self, mda_res_file, taxa_file=None) -> None:
+
+        df = pd.read_table(mda_res_file, sep="\t")
+        if df.shape[1] < 3:
+            df = pd.read_table(mda_res_file, sep=" ")
+        if df.shape[1] < 3:
+            df = pd.read_csv(mda_res_file)
+        if df.shape[1] < 3:
+            raise ValueError("Could not read the MDA res file. Please check the separator and the file format.")
+
+        self.beta = df[df["taxa"] == "mda.beta"]
+        self.alpha = df[df["taxa"] == "mda.alpha.shannon"]
+        self.tax = pd.DataFrame()
+        if taxa_file:
+            self.tax = pd.read_csv(taxa_file)
+            df = df.merge(
+                self.tax[["taxon_id", "taxon_name"]], left_on="taxa", right_on="taxon_id")
+            df.drop(columns=["taxon_id","taxa"], inplace=True)
+        else:
+            df = df.rename(columns={"taxa": "taxon_name"})
+        self.df = df
+        self.order_variables = None
+        self._calculate_eff_matrices()
+        self._calculate_n_signif()
+    def _calculate_eff_matrices(self):
+
+        g_method = self.df.groupby('method')
+        self.methods = g_method.groups.keys()
+        self.effectsizes = {}
+        for (group, data) in g_method:
+            self.effectsizes[group] = data.pivot_table(values="effectsize", index="taxon_name", columns="variable")
+
+    def _calculate_n_signif(self):
+
+        df_qmean = self.df.groupby(
+            ['taxon_name','variable', 'method']
+            )["qvalue"].mean().reset_index()
+
+        sign_counts = df_qmean[df_qmean["qvalue"] < 0.05].groupby(['taxon_name','variable'])["qvalue"].count().reset_index()
+
+        self.n_sign = sign_counts.pivot_table(values="qvalue", index="taxon_name", columns="variable", dropna=False, fill_value=0).astype(int)
+    def _get_phylum_colors(self, effM):
+        tx = self.tax[["taxon_name", "phylum"]]
+        lut = dict(zip(tx["phylum"].unique(), sns.color_palette("Paired", 16)))
+
+        tx = tx.set_index("taxon_name")
+        return tx.reindex(effM.index)["phylum"].map(lut)
+
+    def plot_beta(self, ax=None, *args, **kwargs):
+
+        effB = self.beta.pivot_table(values="effectsize", index="taxa", columns="variable")
+        effB.index = ["effectsize"]
+
+        signB = self.beta.pivot_table(values="qvalue", index="taxa", columns="variable")
+        signB.index = ["qvalue"]
+
+        dfB = pd.concat([effB.T, signB.T], axis=1)
+        dfB["sign"] = pd.cut(dfB["qvalue"], [0.0001, 0.001, 0.01, 0.05, 1], labels=["***", "**", "*", "ns"])
+
+        if self.order_variables is not None:
+            dfB = dfB.loc[self.order_variables]
+        else:
+            dfB = dfB.sort_values("effectsize", ascending=False)
+            self.order_variables = dfB.index
+
+        ax = sns.barplot(
+            data=dfB,
+            x="effectsize",
+            y=dfB.index,
+            *args, **kwargs
+        )
+
+        # add the annotation
+        ax.bar_label(ax.containers[-1], labels=dfB["sign"], label_type="edge", fontsize=8)
+
+        smart_lim = math.ceil(max(abs(dfB["effectsize"]))*10)/10
+        ax.set(xlim=(0, smart_lim))
+
+        return ax.get_figure()
+
+    def plot_alpha(self, *args, **kwargs):
+
+        alpha = self.alpha[self.alpha.variable != "(Intercept)"]
+        alpha = alpha.pivot_table(values=["effectsize","qvalue", "se"], index="taxa", columns="variable")
+
+        eff = alpha["effectsize"].T
+        se = alpha["se"].T
+        sign = alpha["qvalue"].T
+
+        if self.order_variables is not None:
+            eff = eff.loc[self.order_variables]
+            se = se.loc[self.order_variables]
+            sign = sign.loc[self.order_variables]
+        else:
+            eff = eff.sort_values("mda.alpha.shannon", ascending=True)
+            self.order_variables = eff.index
+            se = se.reindex(self.order_variables)
+            sign = sign.reindex(self.order_variables)
+        sign_text = pd.cut(sign.values[:,0], [1e-99, 0.001, 0.01, 0.05, 1], labels=["***", "**", "*", "ns"])
+        fig = plt.figure()
+        xlim = None
+        if "xlim" in kwargs:
+            xlim = kwargs.pop("xlim")
+
+        sns.stripplot(
+            x=eff.values[:,0],
+            y=eff.index,
+            *args, **kwargs
+        )
+        for coordx, coordy, text in zip(eff.values[:,0], eff.index, sign_text):
+
+            plt.annotate(text, (coordx-0.1, coordy), fontsize=8, ha="center")
+
+        plt.errorbar(x=eff.values[:,0], y=eff.index, xerr=se.values[:,0], fmt='o', color='black', ecolor='lightgray', elinewidth=1, capsize=0)
+
+        plt.axvline(0, color="black", linestyle="--")
+        smart_lim = math.ceil(max(abs(eff.values[:,0]))*10)/10
+        
+        if xlim:
+            plt.xlim(xlim)
+
+        return fig
+
+
+    def plot_clustermap(self, method, min_sign=1, min_eff=0.2, *args, **kwargs):
+
+        if method not in self.methods:
+            raise KeyError(f"Method {method} not found in results. Available methods: {self.methods}")
+        # filter results based on sign hits
+        n_sign = self.n_sign[(self.n_sign >= min_sign).any(axis=1)]
+
+        # filter results based on sign hits
+        if min_sign > 0:
+            df_eff = self.effectsizes[method].reindex(n_sign.index, fill_value=0)
+
+        # filter out alpha and beta
+        df_eff = df_eff[~df_eff.index.isin(("mda.alpha.shannon", "mda.beta"))]
+        n_sign = n_sign[~n_sign.index.isin(("mda.alpha.shannon", "mda.beta"))]
+
+        df_eff = df_eff[(abs(df_eff) >= min_eff).any(axis=1)]
+
+        signM = n_sign.reindex(df_eff.index, fill_value=0).astype(str).replace("0", "")
+
+        plot_args = dict(
+            center = 0,
+            fmt = "",
+        )
+        if "phylum" in self.tax.columns:
+          row_col = self._get_phylum_colors(df_eff)
+          plot_args["row_colors"] = row_col
+
+        if "(Intercept)" in df_eff.columns:
+            df_eff.drop(columns="(Intercept)", inplace=True)
+
+        if signM.shape == df_eff.shape:
+            plot_args["annot"] = signM
+        else:
+            print("Warning: sign matrix and effect size matrix do not match in shape")
+
+        return sns.clustermap(
+            df_eff, *args, **kwargs, **plot_args)
+
+def plot_all_methods(mdap, outdir, ext='', min_sign=1, min_eff=0.2, **kwargs):
+
+    sns.set_theme(style="whitegrid", palette="pastel")
+
+    for m in [meth for meth in mdap.methods if meth not in ("alpha","beta")]:
+        fig = mdap.plot_clustermap(m, min_sign=min_sign, min_eff=min_eff, 
+        cmap="vlag", dendrogram_ratio=0.08,
+        colors_ratio=0.03,
+        figsize=(8, 12), **kwargs
+        )
+        fig.ax_row_dendrogram.set_visible(False)
+        for label in fig.ax_heatmap.get_yticklabels():
+            label.set_fontstyle("italic")
+        
+        fig.savefig(f"{outdir}/clustermap_{m}{ext}.svg", dpi=300, format="svg")
+
+```
+
+```{python}
+import pandas as pd
+import difflib 
+
+# renaming variables
+
+df = pd.read_table("mda-out-flow1/results.tsv")
+
+names = pd.read_excel("data/Table vitamins.xlsx")
+
+names.loc[names["Abbreviation"] == "/", "Abbreviation"] = names.loc[names["Abbreviation"] == "/", "Name"]
+
+names = names[~names["quant_table_n"].isna()]
+
+
+vitamin_dict = {}
+
+for v in df["variable"].unique(): 
+    if not v == "(Intercept)":
+        vitamin_dict[v] = difflib.get_close_matches(v, names["Name"])[0]
+
+
+
+abbr_dict = { k:names.loc[names["Name"] == v, "Abbreviation"].iloc[0] for k,v in vitamin_dict.items() }
+
+abbr_dict["x5_2_oxopropylideneamino_6_d_ribitylaminouracil"] += "1"
+abbr_dict["x5_2_oxopropylideneamino_6_d_ribitylaminouracil_3"] += "3"
+
+#name_to_abbr = {n:a for n,a in zip(vitamin_dict.values(), abbr_dict.values())}
+
+df["variable"] = df["variable"].replace(abbr_dict)
+
+df.to_csv("mda-out-flow1/results.tsv", sep="\t", index=False)
+
+```
+
+```{python}
+import matplotlib
+new_rc_params = {'text.usetex': False,
+"svg.fonttype": 'none',
+"font.family": 'sans-serif',
+"font.sans-serif": ['Calibri'],
+}
+matplotlib.rcParams.update(new_rc_params)
+
+mdap = MDAPlot("mda-out-flow1/results.tsv")
+
+for m in mdap.methods:
+    mdap.effectsizes[m] = mdap.effectsizes[m][mdap.n_sign.columns].fillna(0)
+
+plot_all_methods(mdap,"mda-figs", ext="_flow1", min_eff=0)
+betapl = mdap.plot_beta(color="#a2cffe")
+betapl.savefig("mda-figs/beta_flow1.svg", dpi=300, format="svg")
+alphapl = mdap.plot_alpha(xlim=(-0.5, 0.3), color="#a2cffe")
+alphapl.savefig("mda-figs/alpha_flow1.svg", dpi=300, format="svg")
+
+```
+
+```{python}
+import numpy as np
+mdap = MDAPlot("mda-out-flow2/results.tsv")
+
+for m in mdap.methods:
+    mdap.effectsizes[m] = mdap.effectsizes[m][mdap.n_sign.columns]
+
+no_sign = pd.DataFrame(np.zeros_like(mdap.effectsizes["ancombc"], dtype="int"))
+no_sign.index = mdap.effectsizes["ancombc"].index
+no_sign.columns = mdap.effectsizes["ancombc"].columns
+mdap.n_sign = mdap.n_sign.combine_first(no_sign)
+
+plot_all_methods(mdap,"mda-figs", ext="_flow2", min_eff=0, min_sign=0)
+betapl = mdap.plot_beta(color="#a2cffe")
+betapl.savefig("mda-figs/beta_flow2.svg", dpi=300, format="svg")
+alphapl = mdap.plot_alpha(xlim=(-0.5, 0.3), color="#a2cffe")
+alphapl.savefig("mda-figs/alpha_flow2.svg", dpi=300, format="svg")
+
+```
