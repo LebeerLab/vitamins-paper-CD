@@ -1,0 +1,120 @@
+
+```{python}
+import numpy as np
+import pandas as pd
+import altair as alt
+
+# file locations ([source](https://github.com/ravel-lab/MTMG_longitudinal))
+DGE_RESULTS="MT_MG_KEGG_DGE.csv"
+METAG_SUMMARY = "MG_summary_glcorr.txt"
+METAT_KEGGS = "MT_UMD_KEGGsums.txt"
+
+# KEGGS for riboflavin genes
+keggs = {
+    "ribA/ribBA" : ["K01497","K14652"],
+    "ribD" : ["K01498", "K00082","K11752"],
+    "FMN hydrolase" : ["K22912", "K20860", "K20861", "K20862", "K21063", "K21064"],
+    "ribB/ribBA" : ["K02858", "K14652"],
+    "ribH" : ["K00794"],
+    "ribE" : ["K00793"],
+    "ribF" : ["K20884", "K22949", "K11753"]
+}
+
+def retrieve_rib_match(x):
+
+    for k in keggs:
+        if x in keggs[k]:
+            return k
+    return None
+
+
+df = pd.read_csv(DGE_RESULTS)\
+    .rename(columns={"Unnamed: 0" : "KEGG_ko"})
+df_metagenomes = pd.read_table(METAG_SUMMARY)
+
+
+df["rib_gene"] = df.KEGG_ko.apply(lambda x: retrieve_rib_match(x))
+
+df_rib = df[~df["rib_gene"].isna()]
+
+
+reads = pd.read_table(METAT_KEGGS).set_index("KEGG")
+rel_reads = reads/reads.sum()
+
+rel_reads = rel_reads.reset_index()
+rel_reads["rib_gene"] = rel_reads["KEGG"].apply(lambda x: retrieve_rib_match(x))
+rel_rib = rel_reads[~rel_reads.rib_gene.isna()]
+
+
+
+samplenames = [c for c in reads_rib.columns if not c in ["KEGG", "rib_gene"]]
+
+M = rel_rib.drop(columns='rib_gene')\
+    .set_index("KEGG").T\
+        .reset_index()\
+            .rename(columns={"index":"UID"})
+
+
+mgmt = M.merge(df_metagenomes)
+
+
+kegg_numbers = [c for c in mgmt.columns if c.startswith("K0") or c.startswith("K1")]
+kegg_numbers.extend(["UID", "CST", "Stability"])
+mgmt_long = mgmt[kegg_numbers].melt(id_vars=["UID","CST","Stability"])
+mgmt_long["rib_gene"] = mgmt_long["variable"].apply(lambda x: retrieve_rib_match(x))
+
+# Limit to CST I, III and IV
+mgmt_long = mgmt_long[mgmt_long.CST.isin(["I", "III", "IV"])]
+mgmt_long.to_excel("MT_gene_counts_rib.xlsx")
+
+alt.Chart(mgmt_long).mark_circle(size=8).encode(
+    x=alt.X("value:Q", axis=alt.Axis(format=".1e")).title("Relative abundance"),
+    y="CST:N",
+    yOffset="jitter:Q",
+    color="CST:N"
+).facet(
+    facet="rib_gene:N",
+    columns=3
+).transform_calculate(
+    jitter="sqrt(-2*log(random()))*cos(2*PI*random())"
+).resolve_scale(
+    x="independent"
+)
+
+
+```
+
+```{python}
+
+df_rib["xline"] = 0
+df_rib["yline"] = -np.log10(.05)
+
+df_rib["Comparison"] = df_rib["Comparison"].str.replace("_", " vs CST ")
+df_rib["Comparison"] = "CST " + df_rib.Comparison
+
+points = alt.Chart().mark_point().encode(
+    x=alt.X("MT_FC:Q").title("Fold Change"),
+    y=alt.Y("MT_p_log10:Q").title("-log10(P-value)"),
+    color = "KEGG_ko_named:N"
+).transform_calculate(
+    MT_p_log10="-log(datum.MT_p)",
+    KEGG_ko_named="datum.KEGG_ko + ' - ' + datum.rib_gene"
+)
+
+vertical = alt.Chart().mark_rule(color="grey",strokeDash=[3,5]).encode(
+    x="xline:Q"
+)
+horizontal = alt.Chart().mark_rule(color="grey", strokeDash=[3,5]).encode(
+    y="yline:Q"
+)
+
+(points+vertical+horizontal).facet(
+    column="Comparison",
+    data=df_rib, 
+    title="DGE of riboflavin genes between CSTs"
+)
+
+df_rib.drop(columns=["yline","xline"]).to_excel("DGE_rib_genes.xlsx",index=False)
+
+```
+
